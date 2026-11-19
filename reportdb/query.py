@@ -11,6 +11,11 @@
 
 from __future__ import annotations
 
+import re
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+_MAX_LIMIT = 1000
+
 
 class InvalidQuery(Exception):
     """查询片段不符合语法或白名单契约。"""
@@ -28,7 +33,9 @@ def quote_ident(name: str) -> str:
       必须抛出 :class:`InvalidQuery`。
     - 本函数只处理标识符，不处理字符串字面量。
     """
-    raise NotImplementedError
+    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+        raise InvalidQuery(f"非法标识符: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
 
 
 def check_identifier(name: str, allowed: set[str]) -> str:
@@ -42,7 +49,15 @@ def check_identifier(name: str, allowed: set[str]) -> str:
     - 未命中、``allowed`` 为空，或 ``name`` 不满足 :func:`quote_ident`
       的语法时，抛出 :class:`InvalidQuery`。
     """
-    raise NotImplementedError
+    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+        raise InvalidQuery(f"非法标识符: {name!r}")
+    if not allowed:
+        raise InvalidQuery("白名单为空")
+    lowered = name.lower()
+    for entry in allowed:
+        if entry.lower() == lowered:
+            return entry
+    raise InvalidQuery(f"标识符不在白名单中: {name!r}")
 
 
 def build_select(
@@ -77,7 +92,47 @@ def build_select(
     - 返回 ``(sql, params)``，其中 ``params`` 依次是 where 的值与 limit；
       SQL 文本中不得出现任何数据值。
     """
-    raise NotImplementedError
+    _validate_limit(limit)
+    if not columns:
+        raise InvalidQuery("columns 不得为空")
+
+    sql = f"SELECT {', '.join(quote_ident(c) for c in columns)} FROM {quote_ident(table)}"
+    params: list = []
+
+    if where:
+        clauses = []
+        for col, value in where.items():
+            quoted = quote_ident(col)
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    raise InvalidQuery("IN 列表不得为空")
+                clauses.append(f"{quoted} IN ({', '.join('?' for _ in value)})")
+                params.extend(value)
+            elif value is None:
+                raise InvalidQuery("where 值不得为 None")
+            else:
+                clauses.append(f"{quoted} = ?")
+                params.append(value)
+        sql += " WHERE " + " AND ".join(clauses)
+
+    if order_by:
+        parts = []
+        for field, direction in order_by:
+            if direction not in ("ASC", "DESC"):
+                raise InvalidQuery(f"非法排序方向: {direction!r}")
+            parts.append(f"{quote_ident(field)} {direction}")
+        sql += " ORDER BY " + ", ".join(parts)
+
+    sql += " LIMIT ?"
+    params.append(limit)
+    return sql, params
+
+
+def _validate_limit(limit: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise InvalidQuery(f"limit 必须是 int: {limit!r}")
+    if not 1 <= limit <= _MAX_LIMIT:
+        raise InvalidQuery(f"limit 超出范围 1..{_MAX_LIMIT}: {limit!r}")
 
 
 def escape_like(value: str, escape: str = "\\") -> str:
@@ -90,7 +145,16 @@ def escape_like(value: str, escape: str = "\\") -> str:
     - 返回可直接绑定到 ``LIKE ? ESCAPE '<escape>'`` 的值，不添加首尾
       ``%``，也不加引号。例如 ``escape_like("50%") == "50\\%"``。
     """
-    raise NotImplementedError
+    if not isinstance(escape, str) or len(escape) != 1 or escape in ("%", "_"):
+        raise InvalidQuery(f"非法 LIKE 转义符: {escape!r}")
+    if not isinstance(value, str):
+        raise InvalidQuery(f"LIKE 值必须是字符串: {value!r}")
+    out = []
+    for ch in value:
+        if ch == escape or ch in ("%", "_"):
+            out.append(escape)
+        out.append(ch)
+    return "".join(out)
 
 
 def build_search(
@@ -113,4 +177,20 @@ def build_search(
     ``int`` 并以 ``?`` 绑定。``allowed`` 缺少键、列表为空或任一名称不在
     白名单中时，抛出 :class:`InvalidQuery`。
     """
-    raise NotImplementedError
+    _validate_limit(limit)
+    if not isinstance(allowed, dict) or "tables" not in allowed or "columns" not in allowed:
+        raise InvalidQuery("allowed 必须包含 tables 与 columns")
+    tables = set(allowed["tables"])
+    columns = set(allowed["columns"])
+    if not tables or not columns:
+        raise InvalidQuery("白名单不得为空")
+
+    canonical_table = check_identifier(table, tables)
+    canonical_column = check_identifier(column, columns)
+    escaped = escape_like(term)
+
+    sql = (
+        f"SELECT {quote_ident(canonical_column)} FROM {quote_ident(canonical_table)} "
+        f"WHERE {quote_ident(canonical_column)} LIKE ? ESCAPE '\\' LIMIT ?"
+    )
+    return sql, [f"%{escaped}%", limit]
